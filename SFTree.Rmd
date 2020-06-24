@@ -1,0 +1,203 @@
+---
+title: "SFTree"
+author: "Gaurav Sharma"
+date: "23/06/2020"
+output: github_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Prerequisites
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      cache = TRUE)
+library(tidyverse)
+library(tidymodels)
+```
+
+# Lets Load the data
+```{r}
+sf_trees <- read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-01-28/sf_trees.csv")
+sf_trees
+skimr::skim(sf_trees)
+glimpse(sf_trees)
+```
+
+# Lets muatate a outcome variable which determines that which trees are DPW maintained
+```{r}
+tree_df <- sf_trees %>% 
+    mutate(legal_status = case_when(legal_status == 'DPW Maintained' ~ legal_status,
+                                    TRUE ~ 'other'),
+           plot_size = parse_number(plot_size)) %>% 
+    select(-address) %>% 
+    na.omit() %>% 
+    mutate_if(is.character, factor)
+
+skimr::skim(tree_df)    
+```
+
+# Lets visualize the position of trees using lat long
+```{r}
+tree_df %>% 
+    ggplot(aes(latitude, longitude, color = legal_status)) +
+    geom_point(alpha = 0.5) +
+    labs(color = NULL)
+    
+```
+
+# Lets have a look at the relationship between legal status and caretakers
+```{r}
+tree_df %>%
+    count(caretaker, legal_status) %>% 
+    pivot_wider(names_from = legal_status, values_from = n)
+    
+tree_df %>% 
+    ggplot(aes(y = caretaker, x = legal_status)) +
+    geom_bin2d()
+```
+
+# Lets look at this data in a different manner
+```{r}
+tree_df %>% 
+    count(legal_status, caretaker) %>% 
+    add_count(caretaker, wt = n, name = 'caretaker_count') %>% 
+    filter(caretaker_count > 50) %>% 
+    group_by(legal_status) %>% 
+    mutate(percent_legal = n/sum(n)) %>% 
+    ungroup() %>% 
+    ggplot(aes(percent_legal, caretaker, fill = legal_status)) +
+    geom_col(position = 'dodge')
+```
+
+# Lets build a model
+```{r}
+set.seed(123)
+tree_split <- tree_df %>%
+    initial_split(strata = legal_status)
+
+tree_train <- training(tree_split)
+tree_test <- testing(tree_split)
+```
+
+# Lets create a recipe and do some pre-processing
+```{r}
+
+tree_recipe <- recipe(legal_status ~ ., data = tree_train) %>%
+    update_role(tree_id, new_role = 'ID') %>%
+    step_other(species, caretaker, threshold = 0.01) %>%
+    step_other(site_info, threshold = 0.005) %>% 
+    step_dummy(all_nominal(), -all_outcomes()) %>% 
+    step_date(date, features = c('year')) %>%
+    step_rm(date) %>% 
+    step_downsample(legal_status)
+
+tree_recipe %>%
+    prep() %>%
+    juice() %>% 
+    count(legal_status)
+```
+
+# Lets create model specs for Random Forest Model
+```{r}
+tune_spec <-
+    rand_forest(mtry = tune(),
+                trees = 1000,
+                min_n = tune()) %>%
+    set_engine(engine = "ranger") %>%
+    set_mode(mode = "classification")
+
+```
+
+# Lets define a workflow for this model
+```{r}
+tune_wf <-
+    workflow() %>%
+    add_recipe(tree_recipe) %>%
+    add_model(tune_spec)
+
+```
+
+# Lets tune the model now
+
+```{r eval=FALSE, include=FALSE}
+set.seed(234)
+
+tree_folds <- vfold_cv(tree_train, v = 10)
+
+doParallel::registerDoParallel()
+
+set.seed(345)
+
+tune_res <- tune_grid(tune_wf,
+          resamples = tree_folds,
+          grid = 20)
+```
+
+# Lets see the results by collecting metrics
+
+```{r}
+tune_res %>%
+    collect_metrics() %>%
+    ggplot(aes(mtry, mean, color = .metric)) +
+    geom_line(size = 1.5) +
+    geom_vline(xintercept = 32)
+
+tune_res %>%
+    collect_metrics() %>%
+    ggplot(aes(min_n, mean, color = .metric)) +
+    geom_line(size = 1.5) +
+    geom_vline(xintercept = 11)
+
+tune_res %>%
+    collect_metrics() %>%
+    select(mtry, min_n, .metric, mean) %>%
+    pivot_longer(mtry:min_n,
+                 names_to = 'parameter',
+                 values_to = "value") %>%
+    ggplot(aes(value, mean, color = .metric)) +
+    geom_line(size = 1.2) +
+    facet_wrap( ~ parameter)
+
+```
+
+# Lets tune it again using a regular grid this time
+```{r}
+rf_grid <- grid_regular(mtry(range = c(10, 40)),
+                        min_n(range = c(2, 10)),
+                        levels = 5)
+
+regular_res <- tune_grid(tune_wf,
+                         resamples = tree_folds,
+                         grid = rf_grid)
+regular_res %>% 
+    collect_metrics() %>% 
+    filter(.metric == "roc_auc") %>% 
+    ggplot(aes(mtry, mean, color = as.factor(min_n))) +
+    geom_line() +
+    geom_point()
+```
+
+# Lets select the best hyperparameters and finalize our model
+```{r Final Model}
+best_auc <- regular_res %>%
+    select_best(metric = "roc_auc")
+
+final_rf_spec <- finalize_model(tune_spec, best_auc)
+```
+
+# Lets fit this model on the test data and see the results
+```{r}
+
+final_wf <- tune_wf %>% 
+    update_model(spec = final_rf_spec)
+
+last_fit(final_wf, split = tree_split) %>% 
+    collect_metrics()
+```
+
+### Accuracy and ROC both doesn't change much in our test data which indiactes that model is a good fit.
+
+
+
+
+
